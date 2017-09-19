@@ -4,12 +4,11 @@
 
 import os
 import functools
-from .slepc_solver import (
+from .slepc_linalg import (
     slepc_seigsys,
     slepc_svds,
     slepc_mfn_multiply,
 )
-from .scalapy_solver import eigsys_scalapy
 
 
 # Work out if already running as mpi
@@ -124,7 +123,10 @@ class GetMPIBeforeCall(object):
                         "to join comm {}.".format(wait_for_workers, comm)
                     )
 
-        return self.fn(*args, comm=comm, **kwargs)
+        comm.Barrier()
+        res = self.fn(*args, comm=comm, **kwargs)
+        comm.Barrier()
+        return res
 
 
 class SpawnMPIProcessesFunc(object):
@@ -211,11 +213,3 @@ mfn_multiply_slepc_mpi = functools.wraps(slepc_mfn_multiply)(
     GetMPIBeforeCall(slepc_mfn_multiply))
 mfn_multiply_slepc_spawn = functools.wraps(slepc_mfn_multiply)(
     SpawnMPIProcessesFunc(mfn_multiply_slepc_mpi))
-
-
-# --------------------------------- SCALAPY --------------------------------- #
-
-eigsys_scalapy_mpi = functools.wraps(eigsys_scalapy)(
-    GetMPIBeforeCall(eigsys_scalapy))
-eigsys_scalapy_spawn = functools.wraps(eigsys_scalapy)(
-    SpawnMPIProcessesFunc(eigsys_scalapy_mpi))
