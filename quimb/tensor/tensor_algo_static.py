@@ -884,3 +884,151 @@ class DMRGX(DMRG):
 
     def _check_convergence(self, tol):
         return self.variance < tol
+
+
+# -------------------- Shift-invert Matrix Product State -------------------- #
+
+class MPOSolve(DMRG):
+    """Implementation of ``Ax=y`` solve for matrix product tensors.
+    """
+
+    def __init__(self, ham, y, bond_dims, cutoffs=1e-8, bsz=1, p0=None):
+        super().__init__(ham, bond_dims=bond_dims, p0=p0, bsz=bsz,
+                         cutoffs=cutoffs)
+        self._k.add_tag('__ket__')
+        # Want to keep track of ham^2 as well
+        ham1 = self.ham.copy()
+        ham2 = self.ham.copy()
+        ham1.upper_ind_id = self._k.site_ind_id
+        ham1.lower_ind_id = "__ham2{}__"
+        ham2.upper_ind_id = "__ham2{}__"
+        ham2.lower_ind_id = self._b.site_ind_id
+        self.TN_energy2 = self._k | ham1 | ham2 | self._b
+        self.variances = [(self.TN_energy2 ^ ...) - self.energies[-1]**2]
+        self._target_energy = self.energies[-1]
+
+        self.opts = {
+            'compress_method': 'svd',
+            'compress_cutoff_mode': 'sum2',
+            'default_sweep_sequence': 'RRLL',
+        }
+
+    @property
+    def variance(self):
+        return self.variances[-1]
+
+    def _solve(A, y, v0=None):
+        return np.linalg.solve(A, y)
+
+    def _update_local_state_1site_simps(self, i, direction, **compress_opts):
+        """Like ``_update_local_state``, but find the local ``p``, state that
+        minimizes ``||H^2 @ p - H @ p0||``, where ``p0`` is the previous state.
+        """
+        uix = self._k.site[i].inds
+        lix = self._b.site[i].inds
+        dims = self._k.site[i].shape
+
+        # Get the right hand side::
+        #
+        #     o-o-o-o-o/|\o-o-o-o       | | |
+        #     | | | | | | | | | |       | | |
+        #     H-H-H-H-H-H-H-H-H-H   =   LoH0R
+        #     | | | | | | | | | |
+        #     0-0-0-0-0-0-0-0-0-0
+        #
+        # remove the ket site
+        del self._eff_ham1_ok[(self._k.site_tag(i), "__ket__")]
+        # contract to ket the effective bra for RHS vector
+        y = (self._eff_ham1_ok ^ ...).transpose(*uix).data.reshape(-1)
+
+        # Get left hand side operator -> sqaured hamiltonian in local form
+        #
+        #     o-o-o-o-o/|\o-o-o-o
+        #     | | | | | | | | | |        | | |
+        #     H-H-H-H-H-H-H-H-H-H        /-H-\
+        #     | | | | | | | | | |   =   L  |  R
+        #     H-H-H-H-H-H-H-H-H-H        \-H-/
+        #     | | | | | | | | | |        | | |
+        #     o-o-o-o-o\|/o-o-o-o
+        #
+        eff_ham2 = (self._eff_ham2 ^ '__ham__')['__ham__']
+        eff_ham2.fuse((('lower', lix), ('upper', uix)), inplace=True)
+        A = eff_ham2.data
+
+        Am1y = self._seigsys(A, y, v0=self._k.site[i].data).reshape(dims)
+
+        self._k.site[i].udate(data=Am1y, inds=uix)
+        self._b.site[i].udate(data=Am1y.conj(), inds=lix)
+
+        self._compress_after_1site_update(direction, i, **compress_opts)
+        return self._eff_ham() ^ ...
+
+    def _update_local_state_2site_simps(self, i, direction, **compress_opts):
+        raise NotImplementedError("2-site SIMPS not implemented yet.")
+
+    def _update_local_state_simps(self, i, **update_opts):
+        return {
+            1: self._update_local_state_1site_simps,
+            2: self._update_local_state_2site_simps,
+        }[self.bsz](i, **update_opts)
+
+    def sweep(self, direction, canonize=True, verbose=False, **update_opts):
+        """Perform a sweep of the algorithm.
+
+        Parameters
+        ----------
+        direction : {'R', 'L'}
+            Sweep from left to right (->) or right to left (<-) respectively.
+        canonize : bool, optional
+            Canonize the state first, not needed if doing alternate sweeps.
+        verbose : bool, optional
+            Show a progress bar for the sweep.
+        update_opts :
+            Supplied to ``self._update_local_state``.
+        """
+        old_k = self._k.copy().H
+        old_k.drop_tags("__ket__")  # need to select only the upper ket later
+        ham1 = self.ham_copy()
+        self._k.align(ham1, old_k, inplace=True)
+        ham1_ok = TensorNetwork([self._k, ham1, old_k], virtual=True)
+
+        if canonize:
+            {'R': self._k.right_canonize,
+             'L': self._k.left_canonize}[direction](bra=self._b)
+
+        direction, eff_start, sweep = {
+            'R': ('right', 'left', range(0, self.n - self.bsz + 1)),
+            'L': ('left', 'right', reversed(range(0, self.n - self.bsz + 1))),
+        }[direction]
+
+        eff_args = {'n': self.n, 'start': eff_start, 'bsz': self.bsz}
+        eff_ham2s = MovingEnvironment(self.TN_energy2, **eff_args)
+        eff_ham1_oks = MovingEnvironment(ham1_ok, **eff_args)
+
+        if verbose:
+            sweep = progbar(sweep, ncols=80, total=self.n - self.bsz + 1)
+
+        for i in sweep:
+            eff_ham2s.move_to(i)
+            eff_ham1_oks.move_to(i)
+            self._eff_ham2 = eff_ham2s()
+            self._eff_ham1_ok = eff_ham1_oks()
+            en = self._update_local_state_simps(
+                i, direction=direction, **update_opts)
+
+        return en
+
+    def _compute_post_sweep(self):
+        en_var = (self.TN_energy2 ^ ...) - self.energies[-1]**2
+        self.variances.append(en_var)
+
+    def _print_post_sweep(self, converged, verbose=0):
+        if verbose > 1:
+            self._k.show()
+        if verbose > 0:
+            msg = (f"Energy={self.energy}, Variance={self.variance} ... " +
+                   "converged!" if converged else "not converged")
+            print(msg, flush=True)
+
+    def _check_convergence(self, tol):
+        return self.variance < tol
